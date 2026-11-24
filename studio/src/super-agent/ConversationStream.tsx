@@ -11,6 +11,7 @@ import type { LocalAgent } from '../../../shared/local-agents';
 import {
   modeToSuperAgentIntent,
   superAgentIntentMeta,
+  type SuperAgentActionCard,
   type SuperAgentArtifact,
   type SuperAgentChat,
   type SuperAgentChatSummary,
@@ -295,6 +296,7 @@ export function ConversationStream({
   onNotify,
   onRunCommand,
   onOpenAccountSettings,
+  onTriggerActionCard,
   onOpenInDesignStudio,
   onOpenInMotionStudio,
   onOpenInAssets,
@@ -386,6 +388,7 @@ export function ConversationStream({
   onNotify?: (message: string, tone?: 'info' | 'error') => void;
   onRunCommand?: (command: ComposerCommandId) => void;
   onOpenAccountSettings?: () => void;
+  onTriggerActionCard?: (card: SuperAgentActionCard) => void;
   onOpenInDesignStudio?: (projectId: string) => void;
   onOpenInMotionStudio?: (projectId: string) => void;
   onOpenInAssets?: (assetId: string, versionId?: string) => void;
@@ -1839,6 +1842,7 @@ export function ConversationStream({
             onCopyText={onCopyText}
             onNotify={onNotify}
             onOpenAccountSettings={onOpenAccountSettings}
+            onTriggerActionCard={onTriggerActionCard}
             onOpenInDesignStudio={onOpenInDesignStudio}
             onOpenInMotionStudio={onOpenInMotionStudio}
             onOpenInAssets={onOpenInAssets}
