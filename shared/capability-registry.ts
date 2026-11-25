@@ -1,4 +1,5 @@
 import type { Modality, Model } from './gateway.ts';
+import { isSfxModelText } from './audio-kind.ts';
 import { modelCapabilities } from './model-capabilities.ts';
 
 export type CapabilityModality = Modality | '3d';
@@ -232,6 +233,40 @@ export const dubbingCapabilityControls: readonly CapabilityControl[] = [
     choices: [
       { value: 'off', label: 'Audio dubbing only', prompt: 're-voice audio without altering video pixels' },
       { value: 'on', label: 'Match speaker lips', prompt: 'synchronize speaker lip movements to translated audio' },
+    ],
+  },
+];
+
+export const asset3dCapabilityControls: readonly CapabilityControl[] = [
+  {
+    key: 'operation',
+    label: '3D workflow',
+    defaultValue: 'text_to_model',
+    choices: [
+      { value: 'text_to_model', label: 'Text to 3D mesh', prompt: 'generate a PBR textured 3D mesh (.glb) from a text prompt' },
+      { value: 'image_to_model', label: 'Image to 3D mesh', prompt: 'reconstruct a PBR textured 3D mesh (.glb) from 1 pinned reference image' },
+      { value: 'rig_retarget', label: 'Humanoid rig & animate', prompt: 'generate or rig a humanoid 3D mesh with a Mixamo skeleton and animation clip' },
+    ],
+  },
+  {
+    key: 'quality',
+    label: 'Mesh & texture budget',
+    defaultValue: 'hero-balanced',
+    choices: [
+      { value: 'prop-low', label: 'Prop (≤5k faces, 1K tex)', prompt: 'low-poly prop budget (~5,000 faces, 1024px slimmed textures)' },
+      { value: 'hero-balanced', label: 'Hero balanced (≤10k faces, 1K tex)', prompt: 'balanced hero budget (~10,000 faces, 1024px slimmed textures)' },
+      { value: 'hero-high', label: 'Hero high (≤18k faces, 2K tex)', prompt: 'high-detail showcase budget (~18,000 faces, 2048px slimmed textures)' },
+    ],
+  },
+  {
+    key: 'rigPreset',
+    label: 'Rig / animation preset',
+    defaultValue: 'none',
+    choices: [
+      { value: 'none', label: 'Static mesh only', prompt: 'unrigged static GLB mesh' },
+      { value: 'mixamo-idle', label: 'Mixamo rig + idle', prompt: 'auto-rig with Mixamo humanoid skeleton and preset:idle clip' },
+      { value: 'mixamo-walk', label: 'Mixamo rig + walk', prompt: 'auto-rig with Mixamo humanoid skeleton and preset:walk clip' },
+      { value: 'mixamo-run', label: 'Mixamo rig + run', prompt: 'auto-rig with Mixamo humanoid skeleton and preset:run clip' },
     ],
   },
 ];
@@ -642,7 +677,7 @@ export const defaultCapabilities: readonly CapabilityDefinition[] = [
   {
     id: 'music',
     title: 'Music',
-    summary: 'Generate instrumental music or sound effects from mood, tempo and style prompts.',
+    summary: 'Generate instrumental music or soundscapes from mood, tempo and style prompts.',
     modality: 'audio',
     category: 'audio-voice',
     icon: 'music-2-line',
@@ -652,6 +687,26 @@ export const defaultCapabilities: readonly CapabilityDefinition[] = [
     requiresExplicitApproval: false,
     input: { promptRequired: true, minReferences: 0, maxReferences: 0 },
     executor: { kind: 'model', mode: 'text-to-audio' },
+  },
+  {
+    id: 'sound-effects',
+    title: 'Sound effects',
+    summary: 'Generate short game sound effects, foley, UI cues, or seamless ambient loops from a concise text prompt (<= 400 chars).',
+    modality: 'audio',
+    category: 'audio-voice',
+    icon: 'volume-up-line',
+    status: 'live',
+    channels: { gui: true, mcp: true },
+    costTier: 'low',
+    requiresExplicitApproval: false,
+    input: { promptRequired: true, minReferences: 0, maxReferences: 0 },
+    executor: {
+      kind: 'dedicated-model',
+      providers: ['opendesign', 'account', 'fal'],
+      models: ['elevenlabs-sound-v3', 'elevenlabs-sound-effects-v3', 'fal-ai/elevenlabs/sound-effects/v2'],
+      recommendedModel: 'elevenlabs-sound-v3',
+      mode: 'text-to-audio',
+    },
   },
   {
     id: 'speech',
@@ -756,16 +811,30 @@ export const defaultCapabilities: readonly CapabilityDefinition[] = [
   {
     id: '3d-asset',
     title: '3D asset generation',
-    summary: 'Generate textured 3D mesh assets (.glb) from text or product reference images.',
+    summary: 'Generate PBR textured 3D mesh assets (.glb) from text or a single reference image, with optional humanoid rigging, animation retargeting, and automatic texture slimming.',
     modality: '3d',
     category: 'generate',
     icon: 'box-3-line',
-    status: 'coming_soon',
-    channels: { gui: false, mcp: false },
+    status: 'live',
+    channels: { gui: false, mcp: true },
     costTier: 'high',
     requiresExplicitApproval: true,
-    input: { promptRequired: true, minReferences: 0, maxReferences: 4 },
-    executor: { kind: 'model' },
+    input: { promptRequired: false, minReferences: 0, maxReferences: 1, controls: asset3dCapabilityControls },
+    executor: { kind: 'script', scriptId: 'opendesign-3d' },
+  },
+  {
+    id: '3d-world',
+    title: '3D world generation',
+    summary: 'Generate 3D world collider geometry (.glb) and splat artifact descriptors from text or a reference image via World Labs Atlas.',
+    modality: '3d',
+    category: 'generate',
+    icon: 'global-line',
+    status: 'live',
+    channels: { gui: false, mcp: true },
+    costTier: 'high',
+    requiresExplicitApproval: true,
+    input: { promptRequired: false, minReferences: 0, maxReferences: 1 },
+    executor: { kind: 'script', scriptId: 'opendesign-world' },
   },
 ];
 
@@ -845,11 +914,16 @@ export function capabilitySupportsModel(capability: CapabilityDefinition, model:
     return capability.executor.models.includes(model.modelId);
   }
   if (capability.executor.kind === 'dedicated-model') {
-    return capability.executor.providers.includes(model.provider)
-      && capability.executor.models.includes(model.modelId);
+    if (!capability.executor.providers.includes(model.provider)) return false;
+    if (capability.executor.models.includes(model.modelId)) return true;
+    return capability.id === 'sound-effects'
+      && model.modality === 'audio'
+      && model.mode === 'text-to-audio'
+      && isSfxModelText(`${model.modelId} ${model.label}`);
   }
   if (capability.executor.kind === 'model') {
     if (capability.executor.mode && model.mode !== capability.executor.mode) return false;
+    if (capability.id === 'music' && isSfxModelText(`${model.modelId} ${model.label}`)) return false;
     if (capability.input.minReferences > 0) {
       return Boolean(model.supportsImageReference || (model.maxInputImages ?? 0) > 0);
     }

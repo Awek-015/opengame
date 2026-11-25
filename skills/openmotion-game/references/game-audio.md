@@ -2,11 +2,11 @@
 
 # Game Audio
 
-Use this reference for music, voice, SFX and ambience. A game that is silent or only beeps when the brief asks for mood, story or characters is below the quality floor. Generate music and spoken lines through OpenMotion media when a fitting model is listed; synthesize short SFX with the Web Audio API in game code. Normalize and mix in code for predictable in-game loudness.
+Use this reference for music, voice, SFX and ambience. A game that is silent or only beeps when the brief asks for mood, story or characters is below the quality floor. Generate music, spoken lines and signature SFX through OpenMotion capabilities (`music`, `speech`, `sound-effects`) when fitting live models are listed; synthesize fast UI/micro-SFX (or fall back when `sound-effects` is unavailable) with the Web Audio API. Normalize and mix in code for predictable in-game loudness.
 
 ## Discover the live contracts
 
-Follow the `openmotion-media` provider order and consent rules (`openmotion://workflow/media/start`). Before the first audio job:
+Follow the `openmotion-media` provider order and consent rules (`openmotion://workflow/media/start`). Prefer `openmotion_capability_discover` (`action:"list"`, `modality:"audio"`) when exposed to see live `music`, `sound-effects`, and `speech` availability; otherwise inspect raw models:
 
 ```json
 {"tool":"openmotion_media_use","arguments":{"action":"inspect"}}
@@ -25,10 +25,11 @@ Use provider `opendesign` when the account is unavailable, then any other config
 | Background music, menu loop, boss theme | `elevenlabs-music-v2` | `mode:"text-to-audio"`. Prompt instrumental with `no vocals`. Length via the provider-native option (`music_length_ms` on Cloud, whole-second `duration` on the account). |
 | Character lines, narration, announcer (English and multilingual) | `elevenlabs-v3` | `mode:"text-to-speech"`, `parameters.voice` from the model's listed voices. |
 | Chinese character lines and narration | `byteplus-tts-2` | Example voice `zh_female_vv_uranus_bigtts`; pick from the listed voices for tone. |
-| Short SFX (hit, jump, coin, UI click, explosion) | none at review | Web Audio synthesis below. If a later catalogue lists a dedicated SFX model, use it through the same consent flow. |
-| Ambience bed | `elevenlabs-music-v2` as a soft instrumental pad, or Web Audio noise layers | Keep under music level. |
+| Signature SFX & ambience loops (weapon impact, explosion, magic cast, boss roar, rain/wind bed) | `elevenlabs-sound-v3` (capability `sound-effects`) | `mode:"text-to-audio"` (`audioKind:"sfx"`). Only when live discovery lists `sound-effects` / `elevenlabs-sound-v3`; keep prompt concise (**≤ 400 chars**, hard cap 450); supports `duration_seconds` (`0.5–30`), `loop`, `prompt_influence` (`0–1`). Budget ~3–6 signature clips per game. |
+| Instant UI/micro-SFX (clicks, ticks, coin blips, combo chimes) & fallback | Web Audio synthesis | Zero-latency procedural synthesis below; also used whenever `sound-effects` is unavailable or declined. |
+| Ambience bed | `elevenlabs-sound-v3` with `loop:true` (when live), `elevenlabs-music-v2` soft pad, or Web Audio noise layers | Keep under music level. |
 
-Never use a model name that discovery did not return. No dedicated SFX model is a capability gap, not an error: synthesize instead of searching for unlisted names.
+Never use a model name that discovery did not return. When `sound-effects` is inactive or unavailable, synthesize in Web Audio instead of searching for unlisted names.
 
 ## Requests
 
@@ -38,6 +39,12 @@ Music:
 
 ```json
 {"action":"generate","requestId":"game-bgm-01","model":"opendesign:elevenlabs-music-v2","modality":"audio","mode":"text-to-audio","prompt":"Instrumental synthwave racing loop, 128 BPM, driving bass, bright arpeggios, no vocals, seamless loop ending","parameters":{"music_length_ms":30000}}
+```
+
+Sound effects (when live `sound-effects` capability is available):
+
+```json
+{"tool":"openmotion_capability_run","arguments":{"capabilityId":"sound-effects","requestId":"game-sfx-explosion-01","prompt":"Heavy sci-fi plasma explosion with sub-bass punch and metallic debris, clean tail","parameters":{"duration_seconds":1.8,"prompt_influence":0.5}}}
 ```
 
 Speech:

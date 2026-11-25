@@ -3,7 +3,7 @@ import path from 'node:path';
 import { ToolInputError } from '../shared/tool-input-error.ts';
 import type { OmTracking } from '../shared/tracking.ts';
 import type { WorkspaceStore } from '../workspace.ts';
-import type { AssetReference, AssetVersion, LibraryAsset } from '../shared/asset-library.ts';
+import { assetMediaUrl, type AssetReference, type AssetVersion, type LibraryAsset } from '../shared/asset-library.ts';
 import { mediaProviders, modelReferenceLimit, type Modality, type Model } from '../shared/gateway.ts';
 import { generationOptions, resolveGenerationParameters, validateGenerationOptions } from '../shared/generation-options.ts';
 import {
@@ -31,6 +31,7 @@ import {
   type CapabilityScriptOutput,
 } from './capability-scripts.ts';
 import { mediaUse } from './media-use.ts';
+import { discoverOpenDesign3d, discoverOpenDesignWorld, type OpenDesign3dDiscovery } from './opendesign-3d.ts';
 import { gatewayFor } from './service.ts';
 import { transcriptOperation } from './transcript-operations.ts';
 import { transcriptsFor } from './transcription.ts';
@@ -216,6 +217,8 @@ type ScriptExecutionResult = {
   costTier: CapabilityCostTier;
   asset: LibraryAsset;
   version: AssetVersion;
+  mediaUrl: string;
+  result?: Record<string, unknown>;
 };
 
 const inFlightScriptRuns = new Map<string, Promise<ScriptExecutionResult>>();
@@ -259,7 +262,59 @@ export async function capabilityDiscover(
     return mediaUse(store, { action: 'inspect' }, tracking);
   }
   if (args.action === 'models') {
-    if (args.modality === '3d') return { providers: [], catalogs: [], setupRequired: true };
+    if (args.modality === '3d') {
+      const [live3d, liveWorld] = await Promise.all([
+        discoverOpenDesign3d(store, args.refresh === true),
+        discoverOpenDesignWorld(store, args.refresh === true),
+      ]);
+      const byProvider = new Map<string, any[]>();
+      if (live3d.available && live3d.provider) {
+        byProvider.set(live3d.provider, [
+          ...(byProvider.get(live3d.provider) ?? []),
+          ...live3d.models.map(item => ({
+            id: `${live3d.provider}:${item.modelId}`,
+            provider: live3d.provider,
+            modelId: item.modelId,
+            label: item.label,
+            modality: '3d',
+            mode: 'text-to-3d',
+            capabilityId: '3d-asset',
+            source: 'live',
+            ...(item.tier ? { tier: item.tier } : {}),
+            ...(item.bestFor?.length ? { bestFor: item.bestFor } : {}),
+            ...(item.description ? { description: item.description } : {}),
+            ...(item.capabilities ? { nativeOptions: item.capabilities } : {}),
+          })),
+        ]);
+      }
+      if (liveWorld.available && liveWorld.provider) {
+        byProvider.set(liveWorld.provider, [
+          ...(byProvider.get(liveWorld.provider) ?? []),
+          ...liveWorld.models.map(item => ({
+            id: `${liveWorld.provider}:${item.modelId}`,
+            provider: liveWorld.provider,
+            modelId: item.modelId,
+            label: item.label,
+            modality: '3d',
+            mode: 'text-to-world',
+            capabilityId: '3d-world',
+            source: 'live',
+            ...(item.tier ? { tier: item.tier } : {}),
+            ...(item.bestFor?.length ? { bestFor: item.bestFor } : {}),
+            ...(item.description ? { description: item.description } : {}),
+            ...(item.capabilities ? { nativeOptions: item.capabilities } : {}),
+          })),
+        ]);
+      }
+      if (byProvider.size === 0) {
+        return { providers: [], catalogs: [], setupRequired: true };
+      }
+      return {
+        providers: [...byProvider.keys()],
+        catalogs: [...byProvider.entries()].map(([provider, models]) => ({ provider, models })),
+        setupRequired: false,
+      };
+    }
     return mediaUse(
       store,
       {
@@ -280,10 +335,12 @@ export async function capabilityDiscover(
   }
   const catalog = await loadCapabilityCatalog(store);
   const gateway = gatewayFor(store, tracking);
-  const [status, models, asrCatalog] = await Promise.all([
+  const [status, models, asrCatalog, live3d, liveWorld] = await Promise.all([
     gateway.status(),
     gateway.models(),
     transcriptsFor(store).models().catch(() => ({ models: [] as unknown[] })),
+    discoverOpenDesign3d(store, args.refresh === true).catch((): OpenDesign3dDiscovery => ({ available: false, models: [] })),
+    discoverOpenDesignWorld(store, args.refresh === true).catch((): OpenDesign3dDiscovery => ({ available: false, models: [] })),
   ]);
   const availableProviders = new Set(
     status.providers
@@ -293,7 +350,28 @@ export async function capabilityDiscover(
 
   const summarize = (cap: CapabilityDefinition) => {
     if (cap.executor.kind === 'script') {
-      const ready = Boolean(resolveScriptExecutor(cap.executor.scriptId)) && cap.status === 'live';
+      const registered = Boolean(resolveScriptExecutor(cap.executor.scriptId)) && cap.status === 'live';
+      if (cap.executor.scriptId === 'opendesign-3d' || cap.executor.scriptId === 'opendesign-world') {
+        const discovery = cap.executor.scriptId === 'opendesign-world' ? liveWorld : live3d;
+        const ready = registered && discovery.available;
+        const primary = discovery.models[0];
+        return {
+          id: cap.id,
+          title: cap.title,
+          summary: cap.summary,
+          modality: cap.modality,
+          category: cap.category,
+          icon: cap.icon,
+          status: cap.status,
+          channels: cap.channels,
+          costTier: cap.costTier,
+          requiresExplicitApproval: cap.requiresExplicitApproval,
+          executorKind: cap.executor.kind,
+          available: ready,
+          recommendedModel: ready && primary && discovery.provider ? `${discovery.provider}:${primary.modelId}` : `script:${cap.executor.scriptId}`,
+          compatibleModelCount: ready ? discovery.models.length : 0,
+        };
+      }
       return {
         id: cap.id,
         title: cap.title,
@@ -306,9 +384,9 @@ export async function capabilityDiscover(
         costTier: cap.costTier,
         requiresExplicitApproval: cap.requiresExplicitApproval,
         executorKind: cap.executor.kind,
-        available: ready,
+        available: registered,
         recommendedModel: `script:${cap.executor.scriptId}`,
-        compatibleModelCount: ready ? 1 : 0,
+        compatibleModelCount: registered ? 1 : 0,
       };
     }
     if (cap.executor.kind === 'service' && cap.executor.serviceId === 'asr-transcribe') {
@@ -387,6 +465,7 @@ export async function capabilityDiscover(
     const base = summarize(cap);
     const isModelBacked =
       cap.executor.kind === 'model' || cap.executor.kind === 'prompt-preset' || cap.executor.kind === 'dedicated-model';
+    const scriptId = cap.executor.kind === 'script' ? cap.executor.scriptId : undefined;
     const compatible = isModelBacked
       ? selectCompatibleModels(cap, models, availableProviders).map(m => ({
           id: m.id,
@@ -395,7 +474,20 @@ export async function capabilityDiscover(
           label: m.label,
           mode: m.mode,
         }))
-      : [];
+      : scriptId === 'opendesign-3d' || scriptId === 'opendesign-world'
+        ? (() => {
+            const discovery = scriptId === 'opendesign-world' ? liveWorld : live3d;
+            return discovery.available && discovery.provider
+              ? discovery.models.map(m => ({
+                  id: `${discovery.provider}:${m.modelId}`,
+                  provider: discovery.provider,
+                  modelId: m.modelId,
+                  label: m.label,
+                  mode: scriptId === 'opendesign-world' ? 'text-to-world' : 'text-to-3d',
+                }))
+              : [];
+          })()
+        : [];
     return {
       capability: {
         ...base,
@@ -559,6 +651,32 @@ export async function capabilityRun(
       const handler = resolveScriptExecutor(cap.executor.scriptId);
       if (!handler) throw new Error(`CAPABILITY_UNAVAILABLE: Script executor ${cap.executor.scriptId} is not registered`);
       if (args.dryRun === true) {
+        let selectedModel = `script:${cap.executor.scriptId}`;
+        if (cap.executor.scriptId === 'opendesign-3d' || cap.executor.scriptId === 'opendesign-world') {
+          const requestedModel = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : undefined;
+          const colon = requestedModel?.indexOf(':') ?? -1;
+          const requestedProvider = colon > 0 && requestedModel ? requestedModel.slice(0, colon) : undefined;
+          const requestedModelId = colon > 0 && requestedModel ? requestedModel.slice(colon + 1) : requestedModel;
+          const liveSpatial = cap.executor.scriptId === 'opendesign-world'
+            ? await discoverOpenDesignWorld(store, false, requestedProvider)
+            : await discoverOpenDesign3d(store, false, requestedProvider);
+          if (!liveSpatial.available || !liveSpatial.provider) {
+            throw new Error(
+              cap.executor.scriptId === 'opendesign-world'
+                ? 'CAPABILITY_UNAVAILABLE: No active 3D world model is currently exposed on your configured OpenDesign account or Cloud gateway'
+                : 'CAPABILITY_UNAVAILABLE: No active 3D model is currently exposed on your configured OpenDesign account or Cloud gateway',
+            );
+          }
+          const matchedModel = requestedModelId
+            ? liveSpatial.models.find(m => m.modelId === requestedModelId)
+            : liveSpatial.models[0];
+          if (requestedModelId && !matchedModel) {
+            throw new Error(`CAPABILITY_MODEL_INCOMPATIBLE: Model ${requestedModel} is not available for capability ${cap.id}`);
+          }
+          if (matchedModel) {
+            selectedModel = `${liveSpatial.provider}:${matchedModel.modelId}`;
+          }
+        }
         const quote = await estimateCapabilityQuote({
           store,
           capability: cap,
@@ -566,7 +684,7 @@ export async function capabilityRun(
           parameters: args.parameters ?? {},
           referenceCount: references.length,
         });
-        return { dryRun: true, capabilityId: cap.id, executorKind: 'script' as const, selectedModel: `script:${cap.executor.scriptId}`, quote };
+        return { dryRun: true, capabilityId: cap.id, executorKind: 'script' as const, selectedModel, quote };
       }
       await requireNativeRuntime(pluginRoot, 'media');
       await library.validateGeneration({
@@ -580,6 +698,7 @@ export async function capabilityRun(
       });
       const inputHash = assetHash({
         capabilityId: cap.id,
+        model: typeof args.model === 'string' && args.model.trim() ? args.model.trim() : null,
         prompt: rawPrompt,
         options,
         parameters: args.parameters ?? {},
@@ -606,6 +725,8 @@ export async function capabilityRun(
                 costTier: cap.costTier,
                 asset: saved,
                 version: priorVersion,
+                mediaUrl: assetMediaUrl(saved.id, priorVersion.id),
+                ...(priorVersion.result ? { result: priorVersion.result } : {}),
                 replayed: true,
               },
             };
@@ -657,6 +778,7 @@ export async function capabilityRun(
           store,
           capability: cap,
           requestId: args.requestId,
+          ...(typeof args.model === 'string' && args.model.trim() ? { model: args.model.trim() } : {}),
           prompt: rawPrompt,
           options,
           parameters: args.parameters ?? {},
@@ -694,6 +816,7 @@ export async function capabilityRun(
                 requestId: args.requestId,
                 requestHash: inputHash,
                 conversationId: args.conversationId,
+                ...(output.result ? { result: output.result } : {}),
               },
             });
             const version = asset.versions.find(v => v.requestId === args.requestId) ?? asset.versions[asset.versions.length - 1];
@@ -711,6 +834,8 @@ export async function capabilityRun(
             costTier: cap.costTier,
             asset: committed.asset,
             version: committed.version,
+            mediaUrl: assetMediaUrl(committed.asset.id, committed.version.id),
+            ...(committed.version.result ? { result: committed.version.result } : {}),
           };
           reservation.resolveInFlight(result);
           return committed.replayed ? { ...result, replayed: true } : result;
