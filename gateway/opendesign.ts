@@ -59,7 +59,7 @@ export async function cloudWorldModels(baseUrl: string, key: string, fetcher: Fe
     .filter((row: any) => typeof row.model === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,179}$/.test(row.model) && row.kind === 'world_generations')
     .map((row: any) => ({
       modelId: row.model,
-      label: row.model === 'worldlabs-atlas' ? 'World Labs Atlas v2 (Collider GLB + Splat descriptors)' : row.model,
+      label: row.model === 'worldlabs-atlas' ? 'World Labs Atlas v2 (Scene frames, RGB-D, Splats & Mesh)' : row.model,
       ...(row.capabilities && typeof row.capabilities === 'object' && !Array.isArray(row.capabilities) ? { capabilities: row.capabilities } : {}),
     }));
 }

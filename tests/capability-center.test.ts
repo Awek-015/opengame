@@ -1159,12 +1159,13 @@ test('3d-asset capability gates honestly on AMR 3d_generations and executes Trip
     }
   }, false));
 
-test('3d-world capability gates honestly on AMR world_generations and executes World Labs Atlas v2 with multi-artifact colliderMesh GLB selection', () =>
+test('3d-world capability gates honestly on AMR world_generations and follows World Labs Atlas v2 contract (atlasTextToImage PNG, validation guardrails, and GLB mesh selection)', () =>
   fixture(async store => {
     clearOpenDesign3dDiscoveryCache();
     const api = service(store);
     const gateway = gatewayFor(store);
     const glbBytes = makeTinyGlb();
+    const pngBytes = await readFile(await makePng(store.directory, 'atlas-frame.png', '0x3b82f6'));
     let worldEnabled = false;
     const worldPosts: any[] = [];
 
@@ -1182,19 +1183,50 @@ test('3d-world capability gates honestly on AMR world_generations and executes W
       if (url.endsWith('/api/v1/media/worlds/tasks') && init?.method === 'POST') {
         const body = JSON.parse(String(init.body ?? '{}'));
         worldPosts.push(body);
-        return new Response(JSON.stringify({ task_id: 'world_task_01', status: 'queued' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        const taskId = body.operation === 'atlasTextToImage'
+          ? 'world_task_t2i'
+          : body.operation === 'posedImages2Splats'
+            ? 'world_task_splats'
+            : 'world_task_mesh';
+        return new Response(JSON.stringify({ task_id: taskId, status: 'queued' }), { status: 202, headers: { 'Content-Type': 'application/json' } });
       }
-      if (url.includes('/api/v1/media/worlds/tasks/world_task_01/content')) {
+      if (url.includes('/api/v1/media/worlds/tasks/world_task_t2i/content')) {
+        assert.match(url, /artifact=frames_0_image/);
+        return new Response(pngBytes, { status: 200, headers: { 'Content-Type': 'image/png' } });
+      }
+      if (url.endsWith('/api/v1/media/worlds/tasks/world_task_t2i')) {
+        return new Response(JSON.stringify({
+          task_id: 'world_task_t2i',
+          status: 'succeeded',
+          model: 'atlas-v2',
+          artifacts: [
+            { name: 'frames_0_image', asset_id: 'asset_frame_0', content_path: '/api/v1/media/worlds/tasks/world_task_t2i/content?artifact=frames_0_image' },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('/api/v1/media/worlds/tasks/world_task_mesh/content')) {
         assert.match(url, /artifact=colliderMesh/);
         return new Response(glbBytes, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
       }
-      if (url.endsWith('/api/v1/media/worlds/tasks/world_task_01')) {
+      if (url.endsWith('/api/v1/media/worlds/tasks/world_task_mesh')) {
         return new Response(JSON.stringify({
-          task_id: 'world_task_01',
+          task_id: 'world_task_mesh',
           status: 'succeeded',
           artifacts: [
-            { name: 'splats', format: 'spz', asset_id: 'a1', content_path: '/api/v1/media/worlds/tasks/world_task_01/content?artifact=splats' },
-            { name: 'colliderMesh', format: 'glb', asset_id: 'a2', content_path: '/api/v1/media/worlds/tasks/world_task_01/content?artifact=colliderMesh' },
+            { name: 'splats', format: 'spz', asset_id: 'a1', content_path: '/api/v1/media/worlds/tasks/world_task_mesh/content?artifact=splats' },
+            { name: 'colliderMesh', format: 'glb', asset_id: 'a2', content_path: '/api/v1/media/worlds/tasks/world_task_mesh/content?artifact=colliderMesh' },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('/api/v1/media/worlds/tasks/world_task_splats/content')) {
+        return new Response(Buffer.from('SPZ_RAW_DATA'), { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+      if (url.endsWith('/api/v1/media/worlds/tasks/world_task_splats')) {
+        return new Response(JSON.stringify({
+          task_id: 'world_task_splats',
+          status: 'succeeded',
+          artifacts: [
+            { name: 'splats', format: 'spz', asset_id: 'a3', content_path: '/api/v1/media/worlds/tasks/world_task_splats/content?artifact=splats' },
           ],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -1218,32 +1250,211 @@ test('3d-world capability gates honestly on AMR world_generations and executes W
       assert.equal(capAfter?.available, true);
       assert.equal(capAfter?.recommendedModel, 'opendesign:worldlabs-atlas');
 
+      const described = await api.call('openmotion_capability_discover', { action: 'describe', capabilityId: '3d-world' });
+      assert.equal(described.capability.input.controls[0]?.key, 'operation');
+      assert.equal(described.capability.input.controls[0]?.defaultValue, 'atlasTextToImage');
+
       const models3d = await api.call('openmotion_capability_discover', { action: 'models', modality: '3d', refresh: true });
       assert.equal(models3d.setupRequired, false);
       assert.equal(models3d.catalogs[0].models[0].modelId, 'worldlabs-atlas');
       assert.equal(models3d.catalogs[0].models[0].capabilityId, '3d-world');
 
-      const res = await api.call('openmotion_capability_run', {
+      // 1) Guardrail: atlasGenerate without contextFrames/targetCameras fails fast locally with 0 submissions
+      await assert.rejects(
+        api.call('openmotion_capability_run', {
+          action: 'run',
+          requestId: 'world-atlas-invalid-gen',
+          capabilityId: '3d-world',
+          options: { operation: 'atlasGenerate' },
+          prompt: 'Floating sky temple courtyard',
+        }),
+        /contextFrames.*targetCameras/,
+      );
+      await assert.rejects(
+        api.call('openmotion_capability_run', {
+          action: 'run',
+          requestId: 'world-atlas-invalid-rgbd',
+          capabilityId: '3d-world',
+          options: { operation: 'images2PosedRGBD' },
+          prompt: 'Missing reference image',
+        }),
+        /requires at least 1 reference image/,
+      );
+      assert.equal(worldPosts.length, 0);
+
+      // 2) Pure text default submits atlasTextToImage and imports the returned PNG frame cleanly
+      const t2i = await api.call('openmotion_capability_run', {
         action: 'run',
-        requestId: 'world-atlas-1',
+        requestId: 'world-atlas-t2i-1',
         capabilityId: '3d-world',
         prompt: 'Floating sky temple courtyard',
-        parameters: { slim: false },
-        name: 'Sky Temple World',
+        name: 'Sky Temple Concept Frame',
       });
       assert.equal(worldPosts.length, 1);
       assert.deepEqual(worldPosts[0], {
         model: 'worldlabs-atlas',
-        operation: 'atlasGenerate',
+        operation: 'atlasTextToImage',
         prompt: 'Floating sky temple courtyard',
       });
-      assert.equal(res.asset.modality, '3d');
-      assert.equal(res.result.selectedArtifact, 'colliderMesh');
-      assert.equal(res.result.artifacts.length, 2);
-      assert.equal(res.result.artifacts[0].name, 'splats');
-      assert.equal(res.result.triangles, 1);
-      assert.match(res.mediaUrl, /^\/motion-api\/assets\/[^/]+\/versions\/[^/]+\/file$/);
+      assert.equal(t2i.asset.modality, 'image');
+      assert.equal(t2i.version.width, 32);
+      assert.equal(t2i.version.height, 24);
+      assert.equal(t2i.result.operation, 'atlasTextToImage');
+      assert.equal(t2i.result.selectedArtifact, 'frames_0_image');
+      assert.equal(t2i.result.artifactFormat, 'png');
+      assert.equal(t2i.result.mimeType, 'image/png');
+      assert.equal(t2i.result.artifacts.length, 1);
+      assert.match(t2i.mediaUrl, /^\/motion-api\/assets\/[^/]+\/versions\/[^/]+\/file$/);
+
+      // 3) Multi-artifact mesh operation (splats2Mesh) selects colliderMesh GLB and preserves splats descriptor
+      const meshRes = await api.call('openmotion_capability_run', {
+        action: 'run',
+        requestId: 'world-atlas-mesh-1',
+        capabilityId: '3d-world',
+        options: { operation: 'splats2Mesh' },
+        parameters: { splatAssetId: 'a1', slim: false },
+        name: 'Sky Temple Mesh',
+      });
+      assert.equal(worldPosts.length, 2);
+      assert.deepEqual(worldPosts[1], {
+        model: 'worldlabs-atlas',
+        operation: 'splats2Mesh',
+        parameters: { splatAssetId: 'a1' },
+      });
+      assert.equal(meshRes.asset.modality, '3d');
+      assert.equal(meshRes.result.selectedArtifact, 'colliderMesh');
+      assert.equal(meshRes.result.artifactFormat, 'glb');
+      assert.equal(meshRes.result.artifacts.length, 2);
+      assert.equal(meshRes.result.artifacts[0].name, 'splats');
+      assert.equal(meshRes.result.triangles, 1);
+
+      // 4) Non-library .spz-only output surfaces clear guidance instead of raw binary GLB parse failure
+      await assert.rejects(
+        api.call('openmotion_capability_run', {
+          action: 'run',
+          requestId: 'world-atlas-splats-only',
+          capabilityId: '3d-world',
+          options: { operation: 'posedImages2Splats' },
+          parameters: { posedFrames: [{ id: 'f0' }] },
+        }),
+        /splats2Mesh/,
+      );
     } finally {
       clearOpenDesign3dDiscoveryCache();
     }
+  }, false));
+
+test('3d-asset production AMR submissions send canonical UUID X-OpenMotion-Job-Id and matching Idempotency-Key', () =>
+  fixture(async store => {
+    clearOpenDesign3dDiscoveryCache();
+    const api = service(store);
+    const gateway = gatewayFor(store);
+    const glbBytes = makeTinyGlb();
+    const seenHeaders: Array<{ sourceProduct: string | null; jobId: string | null; idempotencyKey: string | null }> = [];
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+    gateway.options.pollMs = 10;
+    gateway.options.fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/v1/media/models')) {
+        return new Response(JSON.stringify({
+          models: [{ model: 'tripo-3.0', kind: '3d_generations' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.endsWith('/api/v1/media/3d/tasks') && init?.method === 'POST') {
+        const headers = new Headers(init.headers);
+        seenHeaders.push({
+          sourceProduct: headers.get('X-Source-Product'),
+          jobId: headers.get('X-OpenMotion-Job-Id'),
+          idempotencyKey: headers.get('Idempotency-Key'),
+        });
+        return new Response(JSON.stringify({ task_id: 'tripo_prod_01', status: 'queued' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/artifacts/model.glb')) {
+        return new Response(glbBytes, { status: 200, headers: { 'Content-Type': 'model/gltf-binary' } });
+      }
+      if (url.endsWith('/api/v1/media/3d/tasks/tripo_prod_01')) {
+        return new Response(JSON.stringify({
+          task_id: 'tripo_prod_01',
+          status: 'succeeded',
+          artifacts: [{ name: 'model.glb', content_type: 'model/gltf-binary', content_path: '/api/v1/media/3d/tasks/tripo_prod_01/artifacts/model.glb' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ error: `unexpected ${url}` }), { status: 404 });
+    }) as typeof fetch;
+
+    await gateway.configureProvider('opendesign', {
+      apiKey: 'sk-test-opendesign',
+      baseUrl: 'https://amr-api.open-design.ai',
+      enabled: true,
+    });
+
+    try {
+      const res = await api.call('openmotion_capability_run', {
+        action: 'run',
+        requestId: 'courtyard_hero_3d_req_1',
+        capabilityId: '3d-asset',
+        prompt: 'Wuxia swordsman in dark indigo robes',
+        parameters: { slim: false },
+        name: 'Wuxia Swordsman',
+      });
+      assert.equal(res.asset.modality, '3d');
+      assert.equal(seenHeaders.length, 1);
+      assert.equal(seenHeaders[0].sourceProduct, 'openmotion');
+      assert.ok(seenHeaders[0].jobId && uuidPattern.test(seenHeaders[0].jobId), `expected UUID X-OpenMotion-Job-Id, got ${seenHeaders[0].jobId}`);
+      assert.equal(seenHeaders[0].idempotencyKey, seenHeaders[0].jobId);
+    } finally {
+      clearOpenDesign3dDiscoveryCache();
+    }
+  }, false));
+
+test('capabilityRun resolves bare modelId without provider prefix against compatible models', () =>
+  fixture(async store => {
+    const api = service(store);
+    const gateway = gatewayFor(store);
+    const wavBytes = makeTinyWav();
+    gateway.options.pollMs = 10;
+    gateway.options.download = async () => wavBytes;
+    gateway.options.fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/v1/media/models')) {
+        return new Response(JSON.stringify({
+          models: [{ model: 'elevenlabs-sound-v3', kind: 'audio_sound_effects' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.endsWith('/api/v1/media/audio/sound-effects') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ task_id: 'sfx_bare_01', status: 'queued' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/api/v1/media/audio/tasks/sfx_bare_01')) {
+        return new Response(JSON.stringify({
+          task_id: 'sfx_bare_01',
+          status: 'succeeded',
+          assets: [{ url: 'https://cdn.example.invalid/whoosh.wav' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ error: `unexpected ${url}` }), { status: 404 });
+    }) as typeof fetch;
+
+    await gateway.configureProvider('opendesign', { apiKey: 'sk-test-opendesign', baseUrl: 'https://amr-mock.example.com', enabled: true });
+    await gateway.listModels({ provider: 'opendesign', refresh: true });
+
+    const submitted = await api.call('openmotion_capability_run', {
+      action: 'run',
+      requestId: 'sfx-bare-model-1',
+      capabilityId: 'sound-effects',
+      model: 'elevenlabs-sound-v3',
+      prompt: 'Heavy bronze gong impact',
+      parameters: { duration_seconds: 2 },
+    });
+    assert.equal(submitted.selectedModel, 'opendesign:elevenlabs-sound-v3');
+    await gateway.tick();
+    await Promise.all([...gateway.active.values()].map(task => task.done));
+    const jobState = await api.call('openmotion_job_manage', { action: 'status', jobId: submitted.job.id });
+    assert.equal(jobState.job.state, 'completed');
   }, false));

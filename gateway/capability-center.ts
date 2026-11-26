@@ -582,7 +582,10 @@ export async function preflightAssetCapabilityGenerate(
       .map(p => p.id),
   );
   const compatible = selectCompatibleModels(cap, models, availableProviders, references.length);
-  const chosen = compatible.find(m => m.id === args.model);
+  const chosen = compatible.find(m => m.id === args.model)
+    ?? (typeof args.model === 'string' && !args.model.includes(':')
+      ? compatible.find(m => m.modelId === args.model)
+      : undefined);
   if (!chosen) {
     const catalogModel = models.find(m => m.id === args.model);
     if (catalogModel && capabilitySupportsModel(cap, catalogModel)) {
@@ -924,7 +927,10 @@ export async function capabilityRun(
     const compatible = selectCompatibleModels(cap, models, availableProviders, references.length);
     let chosen: Model | undefined;
     if (args.model) {
-      chosen = compatible.find(m => m.id === args.model);
+      chosen = compatible.find(m => m.id === args.model)
+        ?? (typeof args.model === 'string' && !args.model.includes(':')
+          ? compatible.find(m => m.modelId === args.model)
+          : undefined);
       if (!chosen) {
         const catalogModel = models.find(m => m.id === args.model);
         if (catalogModel && capabilitySupportsModel(cap, catalogModel)) {

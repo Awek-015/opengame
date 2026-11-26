@@ -271,6 +271,22 @@ export const asset3dCapabilityControls: readonly CapabilityControl[] = [
   },
 ];
 
+export const world3dCapabilityControls: readonly CapabilityControl[] = [
+  {
+    key: 'operation',
+    label: 'Atlas v2 workflow',
+    defaultValue: 'atlasTextToImage',
+    choices: [
+      { value: 'atlasTextToImage', label: 'Text to scene frame (PNG)', prompt: 'generate a scene concept image from text for downstream World Labs Atlas pipelines' },
+      { value: 'images2PosedRGBD', label: 'Images to posed RGB-D', prompt: 'estimate camera poses and RGB-D depth from reference images' },
+      { value: 'atlasGenerate', label: 'Novel-view synthesis', prompt: 'generate spatially consistent views from parameters.contextFrames and parameters.targetCameras' },
+      { value: 'atlasChisel', label: 'Layout / graybox edit', prompt: 'perform structural layout or graybox edits on an Atlas world' },
+      { value: 'posedImages2Splats', label: 'Posed images to splats', prompt: 'reconstruct 3D Gaussian Splats from posed images' },
+      { value: 'splats2Mesh', label: 'Splats to mesh (.glb)', prompt: 'convert Gaussian Splats into a standard polygonal .glb mesh' },
+    ],
+  },
+];
+
 /**
  * Canonical Unified Capability Center catalog shared across Studio GUI menus,
  * AssetComposer, HTTP routes, and MCP meta-tools.
@@ -825,7 +841,7 @@ export const defaultCapabilities: readonly CapabilityDefinition[] = [
   {
     id: '3d-world',
     title: '3D world generation',
-    summary: 'Generate 3D world collider geometry (.glb) and splat artifact descriptors from text or a reference image via World Labs Atlas.',
+    summary: 'Run World Labs Atlas v2 world pipeline tasks: scene concept frames (atlasTextToImage), posed RGB-D (images2PosedRGBD), novel-view synthesis (atlasGenerate with contextFrames + targetCameras), layout edits (atlasChisel), Gaussian Splats (posedImages2Splats), and polygonal meshes (splats2Mesh .glb).',
     modality: '3d',
     category: 'generate',
     icon: 'global-line',
@@ -833,7 +849,7 @@ export const defaultCapabilities: readonly CapabilityDefinition[] = [
     channels: { gui: false, mcp: true },
     costTier: 'high',
     requiresExplicitApproval: true,
-    input: { promptRequired: false, minReferences: 0, maxReferences: 1 },
+    input: { promptRequired: false, minReferences: 0, maxReferences: 10, controls: world3dCapabilityControls },
     executor: { kind: 'script', scriptId: 'opendesign-world' },
   },
 ];

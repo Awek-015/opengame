@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -131,10 +132,10 @@ async function resolveSpatialEndpoint(
         domain === 'world'
           ? {
               modelId: DEFAULT_WORLD_MODEL,
-              label: 'World Labs Atlas v2 (Collider GLB + Splat descriptors)',
+              label: 'World Labs Atlas v2 (Scene frames, RGB-D, Splats & Mesh)',
               tier: 'flagship',
-              bestFor: ['3d-world', 'collider-glb'],
-              description: 'Generate 3D world collider .glb geometry and splat artifact descriptors from text or a reference image.',
+              bestFor: ['3d-world', 'atlas-v2', 'scene-frame', 'world-mesh'],
+              description: 'Run World Labs Atlas v2 tasks (atlasTextToImage, images2PosedRGBD, atlasGenerate, atlasChisel, posedImages2Splats, splats2Mesh).',
             }
           : {
               modelId: DEFAULT_TRIPO_MODEL,
@@ -275,16 +276,46 @@ async function tripoJson<T = any>(
   return parsed as T;
 }
 
+async function prepareUploadReferenceBytes(filePath: string): Promise<{ bytes: Buffer; contentType: string; filename: string }> {
+  let bytes = await readFile(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  let contentType = MIME_BY_EXT[ext] ?? 'image/png';
+  let filename = path.basename(filePath);
+
+  // AMR /api/v1/media/uploads rejects >2MB 2K PNGs with HTTP 413 asset_too_large; transcode large references cleanly to JPEG.
+  if (bytes.length > 1_800_000 && (contentType === 'image/png' || contentType === 'image/webp' || contentType === 'image/jpeg')) {
+    const tmpOut = path.join(os.tmpdir(), `om-3d-ref-${randomUUID()}.jpg`);
+    try {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileAsync = promisify(execFile);
+      if (process.platform === 'darwin') {
+        await execFileAsync('sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '86', '-Z', '1536', filePath, '--out', tmpOut], { timeout: 15_000 });
+      } else {
+        await execFileAsync('ffmpeg', ['-y', '-i', filePath, '-vf', "scale='min(1536,iw)':'min(1536,ih)':force_original_aspect_ratio=decrease", '-q:v', '4', tmpOut], { timeout: 15_000 });
+      }
+      const compressed = await readFile(tmpOut);
+      if (compressed.length > 0 && compressed.length < bytes.length) {
+        bytes = compressed;
+        contentType = 'image/jpeg';
+        filename = `${path.parse(filename).name}.jpg`;
+      }
+    } catch {
+      // Fall back to original bytes if local transcoder is unavailable
+    } finally {
+      await rm(tmpOut, { force: true }).catch(() => {});
+    }
+  }
+  return { bytes, contentType, filename };
+}
+
 async function uploadReferenceImage(
   fetcher: Fetcher,
   config: Resolved3dEndpoint,
   filePath: string,
   idempotencyKey: string,
 ): Promise<string> {
-  const bytes = await readFile(filePath);
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType = MIME_BY_EXT[ext] ?? 'image/png';
-  const filename = path.basename(filePath);
+  const { bytes, contentType, filename } = await prepareUploadReferenceBytes(filePath);
 
   const created = await tripoJson<any>(fetcher, config, '/api/v1/media/uploads', {
     method: 'POST',
@@ -311,7 +342,7 @@ async function uploadReferenceImage(
   const putRes = await fetcher(uploadUrl, {
     method: 'PUT',
     headers: putHeaders,
-    body: bytes,
+    body: new Uint8Array(bytes),
     redirect: 'error',
     signal: AbortSignal.timeout(60_000),
   });
@@ -343,6 +374,23 @@ type TripoTaskResult = {
   raw: Record<string, unknown>;
 };
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Production AMR validates `X-OpenMotion-Job-Id` as a canonical RFC 4122 UUID (rejecting non-UUID
+ * strings with HTTP 400 `invalid_media_attribution`). Derive a deterministic UUID from each
+ * per-step idempotency key so retries keep the exact same job attribution & idempotency key.
+ */
+function deterministicAttributionUuid(key: string): string {
+  const trimmed = key.trim();
+  if (UUID_PATTERN.test(trimmed)) return trimmed.toLowerCase();
+  const bytes = createHash('sha256').update(`openmotion-3d:${trimmed}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 async function submitAndWaitTask(
   fetcher: Fetcher,
   config: Resolved3dEndpoint,
@@ -358,9 +406,10 @@ async function submitAndWaitTask(
   const taskBasePath = options.taskBasePath ?? '/api/v1/media/3d/tasks';
   let taskId = options.existingTaskId;
   if (!taskId) {
+    const submissionJobId = deterministicAttributionUuid(idempotencyKey);
     const submitted = await tripoJson<any>(fetcher, config, taskBasePath, {
       method: 'POST',
-      headers: mediaSubmitHeaders(config.baseUrl, idempotencyKey),
+      headers: mediaSubmitHeaders(config.baseUrl, submissionJobId),
       body: JSON.stringify(payload),
     });
     taskId = String(submitted.task_id ?? submitted.id ?? '');
@@ -778,6 +827,123 @@ export async function runOpenDesign3dScript(ctx: CapabilityScriptContext): Promi
   }
 }
 
+function isGlbArtifactDescriptor(artifact: TripoArtifact): boolean {
+  const name = (artifact.name ?? '').toLowerCase();
+  const format = (artifact.format ?? '').toLowerCase();
+  const contentType = (artifact.content_type ?? '').toLowerCase();
+  const contentPath = (artifact.content_path ?? '').toLowerCase();
+  return name === 'model'
+    || name === 'collidermesh'
+    || name === 'mesh'
+    || name.endsWith('.glb')
+    || format === 'glb'
+    || contentType === 'model/gltf-binary'
+    || contentPath.includes('artifact=model')
+    || contentPath.includes('artifact=collidermesh')
+    || contentPath.includes('artifact=mesh')
+    || contentPath.endsWith('.glb');
+}
+
+function isMediaArtifactDescriptor(artifact: TripoArtifact): boolean {
+  const name = (artifact.name ?? '').toLowerCase();
+  const format = (artifact.format ?? '').toLowerCase();
+  const contentType = (artifact.content_type ?? '').toLowerCase();
+  const contentPath = (artifact.content_path ?? '').toLowerCase();
+  return contentType.startsWith('image/')
+    || contentType.startsWith('video/')
+    || ['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp4', 'webm'].includes(format)
+    || /\.(png|jpe?g|webp|gif|mp4|webm)(?:$|\?)/i.test(contentPath)
+    || /\.(png|jpe?g|webp|gif|mp4|webm)$/i.test(name)
+    || /(?:^|[_-])(image|frame|preview|render|rgb)(?:$|[_-])/i.test(name)
+    || name.includes('_image');
+}
+
+function selectWorldArtifact(artifacts: TripoArtifact[], preferredName?: string): TripoArtifact {
+  const downloadable = artifacts.filter(a => Boolean(a.content_path || a.url));
+  if (downloadable.length === 0) {
+    throw new Error(`3D world task completed without a downloadable artifact: ${JSON.stringify(artifacts).slice(0, 300)}`);
+  }
+  if (preferredName) {
+    const exact = downloadable.find(a => a.name === preferredName);
+    if (!exact) {
+      const availableNames = downloadable.map(a => a.name || a.content_path || 'unnamed').join(', ');
+      throw new Error(`3D world artifact "${preferredName}" was not returned by the task (available: ${availableNames})`);
+    }
+    return exact;
+  }
+  return downloadable.find(isGlbArtifactDescriptor)
+    ?? downloadable.find(isMediaArtifactDescriptor)
+    ?? downloadable[0];
+}
+
+type DetectedArtifactFormat = {
+  kind: 'glb' | 'image' | 'video' | 'unknown';
+  extension: string;
+  mimeType: string;
+};
+
+function detectDownloadedArtifactFormat(
+  buffer: Buffer,
+  contentTypeHeader: string | null,
+  artifact: TripoArtifact,
+): DetectedArtifactFormat {
+  if (buffer.length >= 20 && buffer.readUInt32LE(0) === 0x46546c67) {
+    return { kind: 'glb', extension: 'glb', mimeType: 'model/gltf-binary' };
+  }
+  if (buffer.length >= 8
+    && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+    && buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a) {
+    return { kind: 'image', extension: 'png', mimeType: 'image/png' };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { kind: 'image', extension: 'jpg', mimeType: 'image/jpeg' };
+  }
+  if (buffer.length >= 12
+    && buffer.toString('ascii', 0, 4) === 'RIFF'
+    && buffer.toString('ascii', 8, 12) === 'WEBP') {
+    return { kind: 'image', extension: 'webp', mimeType: 'image/webp' };
+  }
+  if (buffer.length >= 6 && (buffer.toString('ascii', 0, 6) === 'GIF87a' || buffer.toString('ascii', 0, 6) === 'GIF89a')) {
+    return { kind: 'image', extension: 'gif', mimeType: 'image/gif' };
+  }
+  if (buffer.length >= 12 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buffer.toString('ascii', 8, 12).trim();
+    if (/^avi[fs]$/.test(brand)) return { kind: 'image', extension: 'avif', mimeType: 'image/avif' };
+    return { kind: 'video', extension: 'mp4', mimeType: 'video/mp4' };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) {
+    return { kind: 'video', extension: 'webm', mimeType: 'video/webm' };
+  }
+  const declaredMime = (contentTypeHeader?.split(';')[0] ?? artifact.content_type ?? '').trim().toLowerCase();
+  const declaredExt = (artifact.format ?? '').trim().toLowerCase().replace(/^\./, '');
+  return {
+    kind: 'unknown',
+    extension: declaredExt || 'bin',
+    mimeType: declaredMime || 'application/octet-stream',
+  };
+}
+
+async function downloadRawArtifact(
+  fetcher: Fetcher,
+  config: Resolved3dEndpoint,
+  artifact: TripoArtifact,
+): Promise<{ buffer: Buffer; contentType: string | null }> {
+  const target = resolveArtifactDownloadTarget(config, artifact);
+  const controller = new AbortController();
+  return retryRead(async () => {
+    const res = await fetcher(target.url, {
+      headers: target.headers,
+      redirect: 'error',
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!res.ok) {
+      throw new ProviderError(`Failed to download 3D world artifact: HTTP ${res.status}`, res.status);
+    }
+    const buffer = await readBoundedResponseBuffer(res, MAX_SPATIAL_DOWNLOAD_BYTES);
+    return { buffer, contentType: res.headers.get('content-type') };
+  }, controller.signal, 3);
+}
+
 export async function runOpenDesignWorldScript(ctx: CapabilityScriptContext): Promise<CapabilityScriptOutput> {
   const params = ctx.parameters ?? {};
   const requestedRaw = ctx.model || (typeof params.model === 'string' ? params.model : undefined);
@@ -800,12 +966,55 @@ export async function runOpenDesignWorldScript(ctx: CapabilityScriptContext): Pr
     ?? config.models.find(m => m.modelId === DEFAULT_WORLD_MODEL)?.modelId
     ?? config.models[0]?.modelId
     ?? DEFAULT_WORLD_MODEL;
-  const operation = typeof params.operation === 'string' && params.operation.trim()
-    ? params.operation.trim()
-    : (typeof ctx.options.operation === 'string' && ctx.options.operation.trim() ? ctx.options.operation.trim() : 'atlasGenerate');
 
-  if (!ctx.prompt.trim() && ctx.references.length === 0) {
-    throw new Error('3d-world requires a prompt or 1 reference image asset');
+  const explicitParamOp = typeof params.operation === 'string' && params.operation.trim() ? params.operation.trim() : undefined;
+  const optionOp = typeof ctx.options.operation === 'string' && ctx.options.operation.trim() ? ctx.options.operation.trim() : undefined;
+  const hasAtlasGenerateInputs = Array.isArray(params.contextFrames) && params.contextFrames.length > 0
+    && Array.isArray(params.targetCameras) && params.targetCameras.length > 0;
+
+  let operation: string;
+  if (explicitParamOp) {
+    operation = explicitParamOp;
+  } else if (optionOp) {
+    operation = optionOp;
+  } else if (hasAtlasGenerateInputs) {
+    operation = 'atlasGenerate';
+  } else if (ctx.references.length > 0 && !ctx.prompt.trim()) {
+    operation = 'images2PosedRGBD';
+  } else {
+    operation = 'atlasTextToImage';
+  }
+
+  const preferredArtifact = typeof params.artifact === 'string' && params.artifact.trim() ? params.artifact.trim() : undefined;
+  const passthrough: Record<string, unknown> = { ...params };
+  delete passthrough.model;
+  delete passthrough.operation;
+  delete passthrough.artifact;
+  delete passthrough.slim;
+  delete passthrough.max_texture_size;
+  delete passthrough.jpeg_quality;
+
+  if (operation === 'atlasTextToImage') {
+    if (!ctx.prompt.trim()) {
+      throw new Error('3d-world operation=atlasTextToImage requires a non-empty prompt');
+    }
+  } else if (operation === 'atlasGenerate') {
+    const hasContextFrames = Array.isArray(passthrough.contextFrames) && passthrough.contextFrames.length > 0;
+    const hasTargetCameras = Array.isArray(passthrough.targetCameras) && passthrough.targetCameras.length > 0;
+    if (!hasContextFrames || !hasTargetCameras) {
+      throw new Error(
+        '3d-world operation=atlasGenerate requires non-empty parameters.contextFrames and parameters.targetCameras (for text-only scene generation use operation="atlasTextToImage")',
+      );
+    }
+  } else if (operation === 'images2PosedRGBD') {
+    const hasParamImages = (Array.isArray(passthrough.image_asset_ids) && passthrough.image_asset_ids.length > 0)
+      || (Array.isArray(passthrough.images) && passthrough.images.length > 0)
+      || (Array.isArray(passthrough.frames) && passthrough.frames.length > 0);
+    if (ctx.references.length === 0 && !hasParamImages) {
+      throw new Error('3d-world operation=images2PosedRGBD requires at least 1 reference image asset');
+    }
+  } else if (!ctx.prompt.trim() && ctx.references.length === 0 && Object.keys(passthrough).length === 0) {
+    throw new Error(`3d-world operation=${operation} requires a prompt, reference images, or native Atlas v2 parameters`);
   }
 
   const checkpointPath = checkpointFileFor(ctx.store, 'world', ctx.requestId);
@@ -820,13 +1029,6 @@ export async function runOpenDesignWorldScript(ctx: CapabilityScriptContext): Pr
     checkpoint.uploadAssetIds = imageAssetIds;
     await saveCheckpoint(checkpointPath, checkpoint);
   }
-
-  const passthrough: Record<string, unknown> = { ...params };
-  delete passthrough.model;
-  delete passthrough.operation;
-  delete passthrough.slim;
-  delete passthrough.max_texture_size;
-  delete passthrough.jpeg_quality;
 
   const task = await submitAndWaitTask(
     fetcher,
@@ -853,42 +1055,76 @@ export async function runOpenDesignWorldScript(ctx: CapabilityScriptContext): Pr
     await rm(checkpointPath, { force: true }).catch(() => {});
   };
   try {
-    const rawPath = path.join(tempDir, 'world.glb');
-    const slimPath = path.join(tempDir, 'world-slim.glb');
-    const artifact = selectGlbArtifact(task.artifacts);
-    const rawBytes = await downloadArtifact(fetcher, config, artifact, rawPath);
-    const shouldSlim = params.slim !== false;
-    const finalGlb = shouldSlim
-      ? await maybeOptimizeGlb(rawPath, slimPath)
-      : { file: rawPath, slimmed: false, bytes: rawBytes, convertedImages: 0, savedBytes: 0 };
-    const glbInfo = inspectGlb(await readFile(finalGlb.file));
-    return {
-      sourcePath: finalGlb.file,
-      name: ctx.prompt.trim() ? ctx.prompt.trim().slice(0, 80) : `3D World (${operation})`,
-      cleanup,
-      result: {
-        provider: config.provider,
-        model: modelId,
-        operation,
-        taskId: task.taskId,
-        selectedArtifact: artifact.name ?? 'colliderMesh',
-        artifacts: task.artifacts.map(a => ({
-          ...(a.name ? { name: a.name } : {}),
-          ...(a.format ? { format: a.format } : {}),
-          ...(a.asset_id ? { asset_id: a.asset_id } : {}),
-          ...(a.content_path ? { content_path: a.content_path } : {}),
-        })),
-        rawBytes,
-        bytes: finalGlb.bytes,
-        slimmed: finalGlb.slimmed,
-        ...(finalGlb.slimmed ? { convertedImages: finalGlb.convertedImages, savedBytes: finalGlb.savedBytes } : {}),
-        triangles: glbInfo.triangleCount,
-        meshes: glbInfo.meshes.length,
-        skins: glbInfo.skins.length,
-        animations: glbInfo.animations.length,
-        animationNames: glbInfo.animations.map((a: { name: string }) => a.name),
-      },
-    };
+    const artifact = selectWorldArtifact(task.artifacts, preferredArtifact);
+    const { buffer, contentType } = await downloadRawArtifact(fetcher, config, artifact);
+    const detected = detectDownloadedArtifactFormat(buffer, contentType, artifact);
+    const artifactDescriptors = task.artifacts.map(a => ({
+      ...(a.name ? { name: a.name } : {}),
+      ...(a.format ? { format: a.format } : {}),
+      ...(a.asset_id ? { asset_id: a.asset_id } : {}),
+      ...(a.content_path ? { content_path: a.content_path } : {}),
+    }));
+
+    if (detected.kind === 'glb') {
+      const rawPath = path.join(tempDir, 'world.glb');
+      const slimPath = path.join(tempDir, 'world-slim.glb');
+      await writeFile(rawPath, buffer);
+      const rawBytes = buffer.length;
+      const shouldSlim = params.slim !== false;
+      const finalGlb = shouldSlim
+        ? await maybeOptimizeGlb(rawPath, slimPath)
+        : { file: rawPath, slimmed: false, bytes: rawBytes, convertedImages: 0, savedBytes: 0 };
+      const glbInfo = inspectGlb(await readFile(finalGlb.file));
+      return {
+        sourcePath: finalGlb.file,
+        name: ctx.prompt.trim() ? ctx.prompt.trim().slice(0, 80) : `3D World (${operation})`,
+        cleanup,
+        result: {
+          provider: config.provider,
+          model: modelId,
+          operation,
+          taskId: task.taskId,
+          selectedArtifact: artifact.name ?? 'colliderMesh',
+          artifactFormat: 'glb',
+          mimeType: 'model/gltf-binary',
+          artifacts: artifactDescriptors,
+          rawBytes,
+          bytes: finalGlb.bytes,
+          slimmed: finalGlb.slimmed,
+          ...(finalGlb.slimmed ? { convertedImages: finalGlb.convertedImages, savedBytes: finalGlb.savedBytes } : {}),
+          triangles: glbInfo.triangleCount,
+          meshes: glbInfo.meshes.length,
+          skins: glbInfo.skins.length,
+          animations: glbInfo.animations.length,
+          animationNames: glbInfo.animations.map((a: { name: string }) => a.name),
+        },
+      };
+    }
+
+    if (detected.kind === 'image' || detected.kind === 'video') {
+      const mediaPath = path.join(tempDir, `world.${detected.extension}`);
+      await writeFile(mediaPath, buffer);
+      return {
+        sourcePath: mediaPath,
+        name: ctx.prompt.trim() ? ctx.prompt.trim().slice(0, 80) : `3D World (${operation})`,
+        cleanup,
+        result: {
+          provider: config.provider,
+          model: modelId,
+          operation,
+          taskId: task.taskId,
+          selectedArtifact: artifact.name ?? `world.${detected.extension}`,
+          artifactFormat: detected.extension,
+          mimeType: detected.mimeType,
+          artifacts: artifactDescriptors,
+          bytes: buffer.length,
+        },
+      };
+    }
+
+    throw new Error(
+      `3D world task ${task.taskId} (${operation}) returned artifact "${artifact.name ?? 'unknown'}" (${detected.mimeType}, .${detected.extension}), which cannot be imported directly into Workspace Assets. Run operation="splats2Mesh" for a polygonal .glb mesh or select an image/mesh artifact via parameters.artifact. Returned artifacts: ${JSON.stringify(artifactDescriptors).slice(0, 300)}`,
+    );
   } catch (error) {
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     throw error;
